@@ -30,7 +30,7 @@
         "port":""
     },
     "site":{  
-        "port":8081,
+        "port":8083,
         "port_secure":8444,
         "username":"user",
         "password":"12345",
@@ -38,23 +38,14 @@
         "ssl_cert":"/home/pi/garage-door-controller-cert/localhost.crt"
     },
     "doors":{  
-        "left":{  
-            "name":"LEFT",
+        "garage":{  
+            "name":"Garage",
             "relay_pin":23,
             "state_pin":17,
             "state_pin_closed_value":0,
             "approx_time_to_close":15,
             "approx_time_to_open":15,
             "openhab_name":"g_door_left"
-        },
-        "right":{  
-            "name":"RIGHT",
-            "relay_pin":24,
-            "state_pin":21,
-            "state_pin_closed_value":0,
-            "approx_time_to_close":15,
-            "approx_time_to_open":15,
-            "openhab_name":"g_door_right"
         }
     }
 }

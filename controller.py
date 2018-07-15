@@ -1,39 +1,54 @@
-"""Software to monitor and control garage doors via a raspberry pi."""
-
-import time, syslog, uuid
+import time, uuid
 import smtplib
-import RPi.GPIO as gpio
 import json
-import httplib
+import http.client
 import urllib
 import subprocess
+import logging
+from threading import Thread, get_ident
+import uptime
 
-from twisted.internet import task
-from twisted.internet import reactor
-from twisted.internet import ssl
-from twisted.web import server
-from twisted.web.static import File
-from twisted.web.resource import Resource, IResource
-from zope.interface import implements
-
-from twisted.cred import checkers, portal
-from twisted.web.guard import HTTPAuthSessionWrapper, BasicCredentialFactory
+from flask import Flask, make_response, jsonify, request, send_from_directory, abort
+app = Flask(__name__)
 
 from email.mime.text import MIMEText
 from email.utils import formatdate
 from email.utils import make_msgid
 
 
-class HttpPasswordRealm(object):
-    implements(portal.IRealm)
 
-    def __init__(self, myresource):
-        self.myresource = myresource
+def mock_gpio():
+    from unittest.mock import MagicMock
+    global gpio
+    gpio = MagicMock()
+    global gpio_status
+    gpio_status = 0
 
-    def requestAvatar(self, user, mind, *interfaces):
-        if IResource in interfaces:
-            return (IResource, self.myresource, lambda: None)
-        raise NotImplementedError()
+    gpio.input.return_value = gpio_status
+
+def _mock_toggle():
+    global gpio_status
+    logging.info("FAKE TOGGLING GPIO FROM: %s" % gpio_status)
+    time.sleep(3)
+    if gpio_status == 0:
+        gpio_status = 1
+    else:
+        gpio_status = 0
+    
+    gpio.input.return_value = gpio_status
+
+
+
+def mock_toggle():
+    from threading import Timer
+    Timer(3, _mock_toggle).start()
+
+
+try:
+    import RPi.GPIO as gpio
+except ModuleNotFoundError:
+    mock_gpio()
+
 
 class Door(object):
     last_action = None
@@ -56,6 +71,7 @@ class Door(object):
         gpio.output(self.relay_pin, True)
 
     def get_state(self):
+        logging.info("GPIO VAL: %s" % gpio.input(self.state_pin))
         if gpio.input(self.state_pin) == self.state_pin_closed_value:
             return 'closed'
         elif self.last_action == 'open':
@@ -71,8 +87,14 @@ class Door(object):
         else:
             return 'open'
 
+    def get_sensor_state(self):
+        if gpio.input(self.state_pin) == self.state_pin_closed_value:
+            return 'closed'
+        return 'open'
+
     def toggle_relay(self):
         state = self.get_state()
+        print(state)
         if (state == 'open'):
             self.last_action = 'close'
             self.last_action_time = time.time()
@@ -87,6 +109,8 @@ class Door(object):
         time.sleep(0.2)
         gpio.output(self.relay_pin, True)
 
+        mock_toggle()
+
 class Controller(object):
     def __init__(self, config):
         gpio.setwarnings(False)
@@ -94,7 +118,6 @@ class Controller(object):
         gpio.setmode(gpio.BCM)
         self.config = config
         self.doors = [Door(n, c) for (n, c) in config['doors'].items()]
-        self.updateHandler = UpdateHandler(self)
         for door in self.doors:
             door.last_state = 'unknown'
             door.last_state_time = time.time()
@@ -106,59 +129,66 @@ class Controller(object):
             self.use_smtp = False
             smtp_params = ("smtphost", "smtpport", "smtp_tls", "username", "password", "to_email")
             self.use_smtp = ('smtp' in config['alerts']) and set(smtp_params) <= set(config['alerts']['smtp'])
-            syslog.syslog("we are using SMTP")
+            logging.info("we are using SMTP")
         elif self.alert_type == 'pushbullet':
             self.pushbullet_access_token = config['alerts']['pushbullet']['access_token']
-            syslog.syslog("we are using Pushbullet")
+            logging.info("we are using Pushbullet")
         elif self.alert_type == 'pushover':
             self.pushover_user_key = config['alerts']['pushover']['user_key']
-            syslog.syslog("we are using Pushover")
+            logging.info("we are using Pushover")
         else:
             self.alert_type = None
-            syslog.syslog("No alerts configured")
+            logging.info("No alerts configured")
+        
 
-    def status_check(self):
-        for door in self.doors:
-            new_state = door.get_state()
-            if (door.last_state != new_state):
-                syslog.syslog('%s: %s => %s' % (door.name, door.last_state, new_state))
-                door.last_state = new_state
-                door.last_state_time = time.time()
-                self.updateHandler.handle_updates()
-                if self.config['config']['use_openhab'] and (new_state == "open" or new_state == "closed"):
-                    self.update_openhab(door.openhab_name, new_state)
-            if new_state == 'open' and not door.msg_sent and time.time() - door.open_time >= self.ttw:
-                if self.use_alerts:
-                    title = "%s's garage door open" % door.name
-                    etime = elapsed_time(int(time.time() - door.open_time))
-                    message = "%s's garage door has been open for %s" % (door.name, etime)
-                    if self.alert_type == 'smtp':
-                        self.send_email(title, message)
-                    elif self.alert_type == 'pushbullet':
-                        self.send_pushbullet(door, title, message)
-                    elif self.alert_type == 'pushover':
-                        self.send_pushover(door, title, message)
-                    door.msg_sent = True
-
-            if new_state == 'closed':
-                if self.use_alerts:
-                    if door.msg_sent == True:
-                        title = "%s's garage doors closed" % door.name
+    def status_poll(self):
+        import traceback
+        traceback.print_stack()
+        logging.info("%s started" % get_ident())
+        while self.poller_run:
+            time.sleep(5)
+            for door in self.doors:
+                logging.info("%s Door name: %s, %d" % (get_ident(), door.name, len(self.doors)))
+                new_state = door.get_state()
+                logging.info("STATE: %s" % new_state)
+                if (door.last_state != new_state):
+                    logging.info('%s: %s => %s' % (door.name, door.last_state, new_state))
+                    door.last_state = new_state
+                    door.last_state_time = time.time()
+                    if self.config['config']['use_openhab'] and (new_state == "open" or new_state == "closed"):
+                        self.update_openhab(door.openhab_name, new_state)
+                if new_state == 'open' and not door.msg_sent and time.time() - door.open_time >= self.ttw:
+                    if self.use_alerts:
+                        title = "%s's garage door open" % door.name
                         etime = elapsed_time(int(time.time() - door.open_time))
-                        message = "%s's garage door is now closed after %s "% (door.name, etime)
+                        message = "%s's garage door has been open for %s" % (door.name, etime)
                         if self.alert_type == 'smtp':
                             self.send_email(title, message)
                         elif self.alert_type == 'pushbullet':
                             self.send_pushbullet(door, title, message)
                         elif self.alert_type == 'pushover':
                             self.send_pushover(door, title, message)
-                door.open_time = time.time()
-                door.msg_sent = False
+                        door.msg_sent = True
+
+                if new_state == 'closed':
+                    if self.use_alerts:
+                        if door.msg_sent == True:
+                            title = "%s's garage doors closed" % door.name
+                            etime = elapsed_time(int(time.time() - door.open_time))
+                            message = "%s's garage door is now closed after %s "% (door.name, etime)
+                            if self.alert_type == 'smtp':
+                                self.send_email(title, message)
+                            elif self.alert_type == 'pushbullet':
+                                self.send_pushbullet(door, title, message)
+                            elif self.alert_type == 'pushover':
+                                self.send_pushover(door, title, message)
+                    door.open_time = time.time()
+                    door.msg_sent = False
 
     def send_email(self, title, message):
         try:
             if self.use_smtp:
-                syslog.syslog("Sending email message")
+                logging.info("Sending email message")
                 config = self.config['alerts']['smtp']
                 
                 message = MIMEText(message)
@@ -175,11 +205,11 @@ class Controller(object):
                 server.sendmail(config["username"], config["to_email"], message.as_string())
                 server.close()
         except Exception as inst:
-            sys.syslog("Error sending email: " + str(inst))
+            logging.info("Error sending email: " + str(inst))
 
     def send_pushbullet(self, door, title, message):
         try:
-            syslog.syslog("Sending pushbutton message")
+            logging.info("Sending pushbutton message")
             config = self.config['alerts']['pushbullet']
 
             if door.pb_iden != None:
@@ -200,11 +230,11 @@ class Controller(object):
             print(response)
             door.pb_iden = json.loads(response)['iden']
         except Exception as inst:
-            sys.syslog("Error sending to pushbullet: " + str(inst))
+            logging.info("Error sending to pushbullet: " + str(inst))
 
     def send_pushover(self, door, title, message):
         try:
-            syslog.syslog("Sending Pushover message")
+            logging.info("Sending Pushover message")
             config = self.config['alerts']['pushover']
             conn = httplib.HTTPSConnection("api.pushover.net:443")
             conn.request("POST", "/1/messages.json",
@@ -216,31 +246,24 @@ class Controller(object):
                     }), { "Content-type": "application/x-www-form-urlencoded" })
             conn.getresponse()
         except Exception as inst:
-            sys.syslog("Error sending to pushover: " + str(inst))
+            logging.info("Error sending to pushover: " + str(inst))
 
     def update_openhab(self, item, state):
         try:
-            syslog.syslog("Updating openhab")
+            logging.info("Updating openhab")
             config = self.config['openhab']
             conn = httplib.HTTPConnection("%s:%s" % (config['server'], config['port']))
             conn.request("PUT", "/rest/items/%s/state" % item, state)
             conn.getresponse()
         except:
-            sys.syslog("Error updating openhab: " + str(inst))
+            logging.info("Error updating openhab: " + str(inst))
 
     def toggle(self, doorId):
         for d in self.doors:
             if d.id == doorId:
-                syslog.syslog('%s: toggled' % d.name)
+                logging.info('%s: toggled' % d.name)
                 d.toggle_relay()
                 return
-
-    def get_updates(self, lastupdate):
-        updates = []
-        for d in self.doors:
-            if d.last_state_time >= lastupdate:
-                updates.append((d.id, d.last_state, d.last_state_time))
-        return updates
 
     def get_config_with_default(self, config, param, default):
         if not config:
@@ -250,144 +273,34 @@ class Controller(object):
         return config[param]
 
     def run(self):
-        task.LoopingCall(self.status_check).start(0.5)
-        root = File('www')
-        root.putChild('st', StatusHandler(self))
-        root.putChild('upd', self.updateHandler)
-        root.putChild('cfg', ConfigHandler(self))
-        root.putChild('upt', UptimeHandler(self))
-        
         if self.config['config']['use_auth']:
-            clk = ClickHandler(self)
-            args={self.config['site']['username']:self.config['site']['password']}
-            checker = checkers.InMemoryUsernamePasswordDatabaseDontUse(**args)
-            realm = HttpPasswordRealm(clk)
-            p = portal.Portal(realm, [checker])
-            credentialFactory = BasicCredentialFactory("Garage Door Controller")
-            protected_resource = HTTPAuthSessionWrapper(p, [credentialFactory])
-            root.putChild('clk', protected_resource)
+            pass
         else:
-            root.putChild('clk', ClickHandler(self))
+            pass
         
-        site = server.Site(root)
+        # Start the poll timer
+        logging.info("STARTING")
+        self.poller_run = True
+        self.poller = Thread(target=self.status_poll)
+        self.poller.start()
         
         if not self.get_config_with_default(self.config['config'], 'use_https', False):
-            reactor.listenTCP(self.config['site']['port'], site)  # @UndefinedVariable
-            reactor.run()  # @UndefinedVariable
+            app.run(port=self.config['site']['port'], debug=False)
         else:
-            sslContext = ssl.DefaultOpenSSLContextFactory(self.config['site']['ssl_key'], self.config['site']['ssl_cert'])
-            reactor.listenSSL(self.config['site']['port_secure'], site, sslContext)  # @UndefinedVariable
-            reactor.run()  # @UndefinedVariable
+            raise Exception("SSL not supported")
 
-class ClickHandler(Resource):
-    isLeaf = True
-
-    def __init__ (self, controller):
-        Resource.__init__(self)
-        self.controller = controller
-
-    def render(self, request):
-        door = request.args['id'][0]
-        self.controller.toggle(door)
-        return 'OK'
-
-class StatusHandler(Resource):
-    isLeaf = True
-
-    def __init__ (self, controller):
-        Resource.__init__(self)
-        self.controller = controller
-
-    def render(self, request):
-        door = request.args['id'][0]
-        for d in self.controller.doors:
-            if (d.id == door):
-                return d.last_state
-        return ''
-
-class ConfigHandler(Resource):
-    isLeaf = True
-    def __init__ (self, controller):
-        Resource.__init__(self)
-        self.controller = controller
-
-    def render(self, request):
-        request.setHeader('Content-Type', 'application/json')
-
-        return json.dumps([(d.id, d.name, d.last_state, d.last_state_time)
-                            for d in self.controller.doors])
+        self.poller_run = False
+        logging.info("Waiting for background thread to stop")
+        self.poller.join()
+        logging.info("Bye")
 
 
-class UptimeHandler(Resource):
-    isLeaf = True
-    def __init__ (self, controller):
-        Resource.__init__(self)
-
-    def render(self,request):
-        request.setHeader('Content-Type', 'application/json')
-        uptime = subprocess.check_output(['uptime', '-p']).strip()
-        uptime = uptime.replace("up ", "")
-        uptime = uptime.split(",")[0].replace(",","").strip()
-        if (uptime == "up"):
-            uptime = "0 mins"
-        return json.dumps("Uptime: " + uptime)
+def hms_string(sec_elapsed):
+    h = int(sec_elapsed / (60 * 60))
+    m = int((sec_elapsed % (60 * 60)) / 60)
+    s = sec_elapsed % 60.
+    return "{}:{:>02}:{:>05.2f}".format(h, m, s)
     
-class UpdateHandler(Resource):
-    isLeaf = True
-    def __init__(self, controller):
-        Resource.__init__(self)
-        self.delayed_requests = []
-        self.controller = controller
-
-    def handle_updates(self):
-        for request in self.delayed_requests:
-            updates = self.controller.get_updates(request.lastupdate)
-            if updates != []:
-                self.send_updates(request, updates)
-                self.delayed_requests.remove(request)
-
-    def format_updates(self, request, update):
-        response = json.dumps({'timestamp': int(time.time()), 'update':update})
-        if hasattr(request, 'jsonpcallback'):
-            return request.jsonpcallback +'('+response+')'
-        else:
-            return response
-
-    def send_updates(self, request, updates):
-        request.write(self.format_updates(request, updates))
-        request.finish()
-
-    def render(self, request):
-
-        # set the request content type
-        request.setHeader('Content-Type', 'application/json')
-
-        # set args
-        args = request.args
-
-        # set jsonp callback handler name if it exists
-        if 'callback' in args:
-            request.jsonpcallback =  args['callback'][0]
-
-        # set lastupdate if it exists
-        if 'lastupdate' in args:
-            request.lastupdate = float(args['lastupdate'][0])
-        else:
-            request.lastupdate = 0
-
-            #print "request received " + str(request.lastupdate)
-
-        # Can we accommodate this request now?
-        updates = self.controller.get_updates(request.lastupdate)
-        if updates != []:
-            return self.format_updates(request, updates)
-
-
-        request.notifyFinish().addErrback(lambda x: self.delayed_requests.remove(request))
-        self.delayed_requests.append(request)
-
-        # tell the client we're not done yet
-        return server.NOT_DONE_YET
 
 def elapsed_time(seconds, suffixes=['y','w','d','h','m','s'], add_s=False, separator=' '):
     """
@@ -419,9 +332,62 @@ def elapsed_time(seconds, suffixes=['y','w','d','h','m','s'], add_s=False, separ
 
     return separator.join(time)
 
+
+# API
+
+@app.route('/')
+def index():
+    return app.send_static_file('index.html')
+
+
+@app.route('/toggle', methods=['PUT'])
+def click_route():
+    if not request.json:
+        abort(400)
+
+    door = request.json['door']
+    for d in app.controller.doors:
+        if (d.id == door):
+            app.controller.toggle(door)
+            return jsonify(ok="OK")
+
+    return make_response('Not found', 404)
+
+@app.route('/status', methods=['GET'])
+def status_route():
+    door = request.args.get('id')
+    if door:
+        for d in app.controller.doors:
+            if (d.id == door):
+                return jsonify(sensor_status=d.get_sensor_state(),
+                            last_state=d.last_state)
+    
+    return make_response('Not found', 404)
+
+@app.route('/status_all', methods=['GET'])
+def status_all_route():
+    res = {'doors': []}
+    door = res['doors']
+    for d in app.controller.doors:
+        r = {}
+        r['id'] = d.id
+        r['name'] = d.name
+        r['last_state'] = d.last_state
+        r['last_state_time'] = d.last_state_time
+        r['sensor_status'] = d.get_sensor_state()
+        door.append(r)
+
+    return jsonify(res)
+    
+@app.route('/uptime', methods=['GET'])
+def uptime_route():
+    return jsonify(uptime=hms_string(uptime.uptime()))
+
+
 if __name__ == '__main__':
-    syslog.openlog('garage_controller')
-    config_file = open('config.json')
-    controller = Controller(json.load(config_file))
-    config_file.close()
-    controller.run()
+    logging.basicConfig(format='%(levelname)s:%(message)s', level=logging.DEBUG)
+    with open('config.json') as config_file:
+        conf = json.load(config_file)
+    
+    app.controller = Controller(conf)
+    app.controller.run()
